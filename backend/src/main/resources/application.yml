@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: locus
+  config:
+    # Local development: values from backend/.env (git-ignored) are loaded if the file exists.
+    # Real environment variables still take precedence.
+    import: optional:file:.env[.properties]
+  datasource:
+    # Neon connection, e.g. jdbc:postgresql://<host>.neon.tech/neondb?sslmode=require
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USERNAME}
+    password: ${DATABASE_PASSWORD}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks it matches.
+      ddl-auto: validate
+  flyway:
+    locations: classpath:db/migration
+
+server:
+  port: ${PORT:8080}
+  error:
+    include-stacktrace: never
+    include-message: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
