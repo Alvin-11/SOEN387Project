@@ -1,0 +1,681 @@
+openapi: 3.1.0
+info:
+  title: Locus Parking Rental API
+  version: 1.0.0
+  description: |-
+    Contract-first REST API for Locus, a peer-to-peer parking rental service.
+    Owners list parking spaces; drivers search and reserve a specific space for
+    a time interval. A reservation is initially pending payment and is confirmed
+    asynchronously after payment through the Stripe sandbox.
+
+    All monetary amounts are in CAD. Time intervals are half-open [startTime,
+    endTime), so adjacent bookings do not conflict. All timestamps must use
+    RFC 3339 with an explicit UTC offset (for example, 2026-11-12T18:00:00-05:00).
+
+    A reservation POST requires an Idempotency-Key. Retrying with the same key
+    and identical request by the same authenticated caller returns the original
+    reservation; reusing the key with a different request is an error.
+
+    The service enforces the no-overlap invariant atomically. Payment requests
+    are delivered asynchronously; clients poll the reservation resource for
+    pendingPayment, confirmed, or paymentFailed.
+
+    Contract decisions needing team agreement: v1 uses hourly pricing, a
+    Google ID-token exchange for the app's bearer token, and explicit listing
+    availability windows. The proposal did not specify the exact JSON fields
+    for these operations or a cancellation/refund policy.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Spring Boot service
+security: []
+tags:
+  - name: Authentication
+  - name: Parking Spots
+  - name: Reservations
+paths:
+  /auth/google:
+    post:
+      tags: [Authentication]
+      summary: Exchange a Google ID token for a Locus access token
+      operationId: signInWithGoogle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GoogleSignInRequest'
+      responses:
+        '200':
+          description: Authenticated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /parking-spots:
+    get:
+      tags: [Parking Spots]
+      summary: Search visible parking spots
+      operationId: searchParkingSpots
+      description: |-
+        Returns active listings. If startTime and endTime are supplied, only
+        listings available for the full requested interval are returned.
+        Both time parameters must be supplied together.
+      parameters:
+        - name: location
+          in: query
+          description: Address, landmark or area to search near
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - name: startTime
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: endTime
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: maxPricePerHour
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            multipleOf: 0.01
+        - name: parkingType
+          in: query
+          schema:
+            $ref: '#/components/schemas/ParkingType'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Matching parking spots
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParkingSpotPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      tags: [Parking Spots]
+      summary: Create a parking spot listing
+      operationId: createParkingSpot
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParkingSpotCreate'
+      responses:
+        '201':
+          description: Parking spot created
+          headers:
+            Location:
+              description: Relative URL of the new parking spot
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParkingSpot'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /parking-spots/{spotId}:
+    parameters:
+      - $ref: '#/components/parameters/SpotId'
+    get:
+      tags: [Parking Spots]
+      summary: Retrieve parking spot details
+      operationId: getParkingSpot
+      responses:
+        '200':
+          description: Parking spot details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParkingSpot'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Parking Spots]
+      summary: Update an owned parking spot
+      operationId: updateParkingSpot
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParkingSpotUpdate'
+      responses:
+        '200':
+          description: Updated spot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParkingSpot'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Parking Spots]
+      summary: Deactivate an owned listing
+      operationId: deactivateParkingSpot
+      description: Deactivates the spot for new reservations; existing reservations remain recorded.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Deactivated
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /parking-spots/{spotId}/availability:
+    parameters:
+      - $ref: '#/components/parameters/SpotId'
+    get:
+      tags: [Parking Spots]
+      summary: Check availability during a given interval
+      operationId: getParkingSpotAvailability
+      parameters:
+        - $ref: '#/components/parameters/StartTime'
+        - $ref: '#/components/parameters/EndTime'
+      responses:
+        '200':
+          description: Availability snapshot, not a guarantee until reservation is accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /parking-spots/{spotId}/reservations:
+    parameters:
+      - $ref: '#/components/parameters/SpotId'
+    post:
+      tags: [Reservations]
+      summary: Atomically reserve a parking spot and request payment
+      operationId: createReservation
+      description: |-
+        Atomically checks listing availability and absence of overlapping active
+        reservations, creates a pending-payment reservation, and persists a
+        payment-requested outbox event. Stripe is NOT called synchronously.
+        Returns 409 if the interval is unavailable. Payment completion is
+        discovered by GET /reservations/{reservationId}.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationCreate'
+            example:
+              startTime: '2026-11-12T18:00:00-05:00'
+              endTime: '2026-11-12T22:00:00-05:00'
+      responses:
+        '202':
+          description: Reservation held pending asynchronous payment
+          headers:
+            Location:
+              description: Relative URL of the reservation
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+              example:
+                reservationId: res_123
+                spotId: spot_150
+                userId: user_42
+                startTime: '2026-11-12T18:00:00-05:00'
+                endTime: '2026-11-12T22:00:00-05:00'
+                status: pendingPayment
+                totalPrice: 20.00
+                currency: CAD
+                createdAt: '2026-11-07T15:00:00-05:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /reservations/{reservationId}:
+    parameters:
+      - $ref: '#/components/parameters/ReservationId'
+    get:
+      tags: [Reservations]
+      summary: Get a reservation and its current payment status
+      operationId: getReservation
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Reservation details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Reservations]
+      summary: Cancel an eligible reservation
+      operationId: cancelReservation
+      description: |-
+        Only the reserving driver may cancel. The domain cancellation policy
+        determines eligibility; ineligible cancellation returns 409. Payment
+        refunds, if applicable, require a separately specified policy and are
+        not promised by this v1 contract.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cancelled reservation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /me/reservations:
+    get:
+      tags: [Reservations]
+      summary: List current user's reservations
+      operationId: listMyReservations
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user's reservations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Reservation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /me/parking-spots:
+    get:
+      tags: [Parking Spots]
+      summary: List current user's owned parking spots
+      operationId: listMyParkingSpots
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user's owned listings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParkingSpot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Locus-issued JWT obtained using POST /auth/google
+  parameters:
+    SpotId:
+      name: spotId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    ReservationId:
+      name: reservationId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    StartTime:
+      name: startTime
+      in: query
+      required: true
+      schema:
+        type: string
+        format: date-time
+    EndTime:
+      name: endTime
+      in: query
+      required: true
+      schema:
+        type: string
+        format: date-time
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |-
+        Unique client-generated key per logical reservation attempt.
+        Replays with identical caller, method, target and body return the
+        stored reservation response. Reuse with different request data is 409.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+  responses:
+    BadRequest:
+      description: Invalid or missing request data
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Unauthorized:
+      description: Missing, expired or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Forbidden:
+      description: Authenticated caller does not own the resource
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    NotFound:
+      description: Resource does not exist or is not visible
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Conflict:
+      description: Interval unavailable, ineligible state transition or idempotency-key mismatch
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          examples:
+            spotUnavailable:
+              summary: Overlapping reservation
+              value:
+                code: PARKING_SPOT_UNAVAILABLE
+                message: The parking spot is already reserved during the requested time interval.
+                correlationId: req_8f91
+            keyMismatch:
+              summary: Idempotency key reused for a different request
+              value:
+                code: IDEMPOTENCY_KEY_REUSED
+                message: The idempotency key was already used for a different request.
+                correlationId: req_8f92
+  schemas:
+    GoogleSignInRequest:
+      type: object
+      additionalProperties: false
+      required: [idToken]
+      properties:
+        idToken:
+          type: string
+          minLength: 1
+          description: Google identity token; server verifies its signature, issuer, audience and expiry
+    TokenResponse:
+      type: object
+      additionalProperties: false
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken:
+          type: string
+        tokenType:
+          type: string
+          const: Bearer
+        expiresIn:
+          type: integer
+          minimum: 1
+          description: Access token validity in seconds
+    ParkingType:
+      type: string
+      enum: [driveway, privateLot, garage, other]
+    TimeWindow:
+      type: object
+      additionalProperties: false
+      required: [startTime, endTime]
+      properties:
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+      description: End must be strictly later than start (enforced by application logic)
+    ParkingSpotCreate:
+      type: object
+      required: [title, address, pricePerHour, availabilityWindows]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 2000
+        address:
+          type: string
+          minLength: 1
+          maxLength: 300
+        photoUrl:
+          type: string
+          format: uri
+        pricePerHour:
+          type: number
+          exclusiveMinimum: 0
+          multipleOf: 0.01
+          description: Hourly price in CAD
+        parkingType:
+          $ref: '#/components/schemas/ParkingType'
+        restrictions:
+          type: string
+          maxLength: 1000
+        availabilityWindows:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TimeWindow'
+    ParkingSpotUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 2000
+        address:
+          type: string
+          minLength: 1
+          maxLength: 300
+        photoUrl:
+          type: string
+          format: uri
+        pricePerHour:
+          type: number
+          exclusiveMinimum: 0
+          multipleOf: 0.01
+        parkingType:
+          $ref: '#/components/schemas/ParkingType'
+        restrictions:
+          type: string
+          maxLength: 1000
+        availabilityWindows:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TimeWindow'
+    ParkingSpot:
+      allOf:
+        - $ref: '#/components/schemas/ParkingSpotCreate'
+        - type: object
+          required: [spotId, ownerId, active, createdAt]
+          properties:
+            spotId:
+              type: string
+            ownerId:
+              type: string
+            active:
+              type: boolean
+            createdAt:
+              type: string
+              format: date-time
+    ParkingSpotPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParkingSpot'
+        total:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+        offset:
+          type: integer
+          minimum: 0
+    AvailabilityResponse:
+      type: object
+      additionalProperties: false
+      required: [spotId, startTime, endTime, available]
+      properties:
+        spotId:
+          type: string
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        available:
+          type: boolean
+        reason:
+          type: [string, 'null']
+          enum: [outsideOwnerAvailability, alreadyReserved, inactive, null]
+    ReservationCreate:
+      type: object
+      additionalProperties: false
+      required: [startTime, endTime]
+      properties:
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+      description: |-
+        Interval must be in the future, with endTime > startTime, and contained
+        within the owner's availability windows. The authenticated user is the
+        reserver; no userEmail or userId is accepted from the client.
+    ReservationStatus:
+      type: string
+      enum: [pendingPayment, confirmed, paymentFailed, cancelled]
+      description: |-
+        Allowed transitions: pendingPayment -> confirmed, paymentFailed or
+        cancelled; confirmed -> cancelled only when permitted by policy.
+        Terminal statuses paymentFailed and cancelled no longer block inventory.
+    Reservation:
+      type: object
+      additionalProperties: false
+      required: [reservationId, spotId, userId, startTime, endTime, status, totalPrice, currency, createdAt]
+      properties:
+        reservationId:
+          type: string
+        spotId:
+          type: string
+        userId:
+          type: string
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/ReservationStatus'
+        totalPrice:
+          type: number
+          minimum: 0
+          multipleOf: 0.01
+          description: Charge for booked duration in CAD; exact rounding and fee policy must be agreed by the team
+        currency:
+          type: string
+          const: CAD
+        createdAt:
+          type: string
+          format: date-time
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message, correlationId]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code
+          examples: [PARKING_SPOT_UNAVAILABLE]
+        message:
+          type: string
+        correlationId:
+          type: string
+          description: Trace identifier also included in structured logs
+        details:
+          type: object
+          additionalProperties: true

@@ -33,3 +33,4 @@ management:
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
+    url: /openapi.yaml
